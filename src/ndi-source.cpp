@@ -382,6 +382,48 @@ void ndi_source_thread_process_audio3(ndi_source_config_t *config, NDIlib_audio_
 void ndi_source_thread_process_video2(ndi_source_t *source, NDIlib_video_frame_v2_t *ndi_video_frame,
 				      obs_source *obs_source, obs_source_frame *obs_video_frame);
 
+// Discard what the NDI receiver queued while the source was not showing (capture is skipped then), so that stale
+// frames are not handed to OBS, whose buffered async video queue would otherwise keep that backlog as permanent
+// extra latency. The newest queued video frame is the current picture and is passed on to OBS.
+static void ndi_source_thread_flush_receiver(ndi_source_t *s, NDIlib_recv_instance_t ndi_receiver,
+					     obs_source_frame *obs_video_frame)
+{
+	NDIlib_video_frame_v2_t newest_video_frame;
+	bool have_video_frame = false;
+	int discarded_video = 0;
+	int discarded_audio = 0;
+
+	// Safety cap only: a real drain ends after the queue depth plus the few frames that arrive meanwhile.
+	for (int i = 0; i < 1000; ++i) {
+		NDIlib_video_frame_v2_t video_frame;
+		NDIlib_audio_frame_v3_t audio_frame;
+		auto frame_type = ndiLib->recv_capture_v3(ndi_receiver, &video_frame, &audio_frame, nullptr, 0);
+
+		if (frame_type == NDIlib_frame_type_video) {
+			if (have_video_frame) {
+				ndiLib->recv_free_video_v2(ndi_receiver, &newest_video_frame);
+				discarded_video++;
+			}
+			newest_video_frame = video_frame;
+			have_video_frame = true;
+		} else if (frame_type == NDIlib_frame_type_audio) {
+			ndiLib->recv_free_audio_v3(ndi_receiver, &audio_frame);
+			discarded_audio++;
+		} else if (frame_type == NDIlib_frame_type_none || frame_type == NDIlib_frame_type_error) {
+			break;
+		}
+	}
+
+	if (have_video_frame) {
+		ndi_source_thread_process_video2(s, &newest_video_frame, s->obs_source, obs_video_frame);
+		ndiLib->recv_free_video_v2(ndi_receiver, &newest_video_frame);
+	}
+
+	obs_log(LOG_DEBUG,
+		"'%s' ndi_source_thread: source showing again; discarded %d video and %d audio frames queued while hidden",
+		obs_source_get_name(s->obs_source), discarded_video, discarded_audio);
+}
+
 void *ndi_source_thread(void *data)
 {
 	auto s = (ndi_source_t *)data;
@@ -408,6 +450,7 @@ void *ndi_source_thread(void *data)
 
 	int64_t timestamp_audio = 0;
 	int64_t timestamp_video = 0;
+	bool was_showing = true;
 
 	//
 	// Main NDI receiver loop: BEGIN
@@ -649,9 +692,17 @@ void *ndi_source_thread(void *data)
 		// the fps of OBS can decrease dramatically, especially with multiple 4K 60 sources.
 		//
 		if (!obs_source_showing(s->obs_source)) {
+			was_showing = false;
 			// Avoid busy-waiting when the source is hidden but kept active.
 			std::this_thread::sleep_for(std::chrono::milliseconds(5));
 			continue;
+		}
+
+		if (!was_showing) {
+			was_showing = true;
+			// Frame sync always returns the current frame, so only the plain receiver builds up a backlog.
+			if (!ndi_frame_sync)
+				ndi_source_thread_flush_receiver(s, ndi_receiver, &obs_video_frame);
 		}
 
 		if (ndi_frame_sync) {
